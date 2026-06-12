@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local tooling
+.claude/
+
+# Logs / OS files
+npm-debug.log*
+*.log
+.DS_Store
+Thumbs.db

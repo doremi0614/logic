@@ -1,0 +1,1183 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Cpu,
+  Download,
+  FileText,
+  Info,
+  Maximize,
+  Minus,
+  Play,
+  Plus,
+  Settings,
+  Square,
+  Trash2,
+  X,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
+
+/* ------------------------------ Example data ------------------------------ */
+
+const EXAMPLE_ROWS = [
+  { ps: "A", x: "0", ns: "A", z: "0" },
+  { ps: "A", x: "1", ns: "B", z: "0" },
+  { ps: "B", x: "0", ns: "C", z: "0" },
+  { ps: "B", x: "1", ns: "B", z: "1" },
+  { ps: "C", x: "0", ns: "A", z: "1" },
+  { ps: "C", x: "1", ns: "B", z: "0" },
+];
+
+/* ------------------------- Boolean minimization -------------------------- */
+/* Quine-McCluskey with don't cares. Terms are strings over {0,1,-},        */
+/* MSB-first in the same order as the `vars` array of the equation.         */
+
+function grayCodes(bits) {
+  if (bits === 0) return [""];
+  const prev = grayCodes(bits - 1);
+  return [...prev.map((c) => "0" + c), ...[...prev].reverse().map((c) => "1" + c)];
+}
+
+function implicantCovers(imp, mintermBits) {
+  for (let k = 0; k < imp.length; k++) {
+    if (imp[k] !== "-" && imp[k] !== mintermBits[k]) return false;
+  }
+  return true;
+}
+
+function qmSimplify(numVars, ones, dontCares) {
+  if (ones.length === 0) return { kind: "zero", terms: [] };
+  const all = new Set([...ones, ...dontCares]);
+  if (all.size === 1 << numVars) return { kind: "one", terms: [] };
+
+  const toBits = (m) => m.toString(2).padStart(numVars, "0");
+
+  // Iteratively combine adjacent implicants; the ones that never combine
+  // are the prime implicants.
+  let current = [...all].map(toBits);
+  const primes = new Set();
+  while (current.length) {
+    const used = new Set();
+    const next = new Set();
+    for (let i = 0; i < current.length; i++) {
+      for (let j = i + 1; j < current.length; j++) {
+        const a = current[i];
+        const b = current[j];
+        let diff = -1;
+        let ok = true;
+        for (let k = 0; k < numVars; k++) {
+          if (a[k] === b[k]) continue;
+          if (a[k] === "-" || b[k] === "-" || diff !== -1) {
+            ok = false;
+            break;
+          }
+          diff = k;
+        }
+        if (ok && diff !== -1) {
+          used.add(a);
+          used.add(b);
+          next.add(a.slice(0, diff) + "-" + a.slice(diff + 1));
+        }
+      }
+    }
+    for (const t of current) if (!used.has(t)) primes.add(t);
+    current = [...next];
+  }
+
+  // Cover only the required minterms (not the don't cares):
+  // essential prime implicants first, then a greedy cover for the rest.
+  const primeList = [...primes];
+  const chosen = [];
+  const uncovered = new Set(ones);
+  let changed = true;
+  while (changed && uncovered.size) {
+    changed = false;
+    for (const m of [...uncovered]) {
+      const bits = toBits(m);
+      if (chosen.some((p) => implicantCovers(p, bits))) {
+        uncovered.delete(m);
+        changed = true;
+        continue;
+      }
+      const covering = primeList.filter((p) => implicantCovers(p, bits));
+      if (covering.length === 1) {
+        chosen.push(covering[0]);
+        for (const mm of [...uncovered]) {
+          if (implicantCovers(covering[0], toBits(mm))) uncovered.delete(mm);
+        }
+        changed = true;
+      }
+    }
+  }
+  while (uncovered.size) {
+    let best = null;
+    let bestCount = 0;
+    for (const p of primeList) {
+      if (chosen.includes(p)) continue;
+      let c = 0;
+      for (const m of uncovered) if (implicantCovers(p, toBits(m))) c++;
+      if (c > bestCount) {
+        bestCount = c;
+        best = p;
+      }
+    }
+    if (!best) break;
+    chosen.push(best);
+    for (const m of [...uncovered]) {
+      if (implicantCovers(best, toBits(m))) uncovered.delete(m);
+    }
+  }
+  chosen.sort();
+  return { kind: "sop", terms: chosen };
+}
+
+function termToText(bits, vars) {
+  const lits = [];
+  for (let k = 0; k < bits.length; k++) {
+    if (bits[k] === "1") lits.push(vars[k]);
+    else if (bits[k] === "0") lits.push(vars[k] + "′");
+  }
+  return lits.length ? lits.join("·") : "1";
+}
+
+function exprToText(result, vars) {
+  if (result.kind === "zero") return "0";
+  if (result.kind === "one") return "1";
+  return result.terms.map((t) => termToText(t, vars)).join(" + ");
+}
+
+/* --------------------- Sequential circuit design core --------------------- */
+/* state table -> state assignment -> excitation tables -> simplified SOP    */
+
+function designCircuit(rows, model, ffType, xName, zName) {
+  const errors = [];
+  const warnings = [];
+  const clean = rows.map((r, i) => ({
+    ps: r.ps.trim(),
+    x: r.x.trim(),
+    ns: r.ns.trim(),
+    z: r.z.trim(),
+    line: i + 1,
+  }));
+
+  if (clean.length === 0) errors.push("State table is empty.");
+  for (const r of clean) {
+    if (!r.ps || !r.ns) errors.push(`Row ${r.line}: state name is empty.`);
+    if (r.x !== "0" && r.x !== "1") errors.push(`Row ${r.line}: ${xName} must be 0 or 1.`);
+    if (r.z !== "0" && r.z !== "1") errors.push(`Row ${r.line}: ${zName} must be 0 or 1.`);
+  }
+  if (errors.length) return { errors, warnings };
+
+  const states = [];
+  for (const r of clean) if (!states.includes(r.ps)) states.push(r.ps);
+  for (const r of clean) {
+    if (!states.includes(r.ns))
+      errors.push(`Row ${r.line}: next state "${r.ns}" never appears as a present state.`);
+  }
+  const seen = new Set();
+  for (const r of clean) {
+    const key = r.ps + "|" + r.x;
+    if (seen.has(key)) errors.push(`Row ${r.line}: duplicate row for state ${r.ps}, ${xName}=${r.x}.`);
+    seen.add(key);
+  }
+  if (states.length > 8) errors.push("At most 8 states are supported.");
+  if (errors.length) return { errors, warnings };
+
+  const n = Math.max(1, Math.ceil(Math.log2(states.length)));
+  const codeOf = new Map(states.map((s, i) => [s, i.toString(2).padStart(n, "0")]));
+  const qNames = Array.from({ length: n }, (_, i) => `Q${n - 1 - i}`);
+  const vars = [...qNames, xName];
+  const numVars = n + 1;
+
+  const table = () => ({ ones: [], dcs: [] });
+  const jT = Array.from({ length: n }, table);
+  const kT = Array.from({ length: n }, table);
+  const tT = Array.from({ length: n }, table);
+  const zT = table();
+  const covered = new Set();
+
+  for (const r of clean) {
+    const q = codeOf.get(r.ps);
+    const qn = codeOf.get(r.ns);
+    const m = parseInt(q + r.x, 2);
+    covered.add(m);
+    for (let b = 0; b < n; b++) {
+      const cur = q[b];
+      const nxt = qn[b];
+      if (ffType === "jk") {
+        // JK excitation: 0->0 J=0 K=d | 0->1 J=1 K=d | 1->0 J=d K=1 | 1->1 J=d K=0
+        if (cur === "0") {
+          if (nxt === "1") jT[b].ones.push(m);
+          kT[b].dcs.push(m);
+        } else {
+          jT[b].dcs.push(m);
+          if (nxt === "0") kT[b].ones.push(m);
+        }
+      } else {
+        // T excitation: T = Q xor Q+
+        if (cur !== nxt) tT[b].ones.push(m);
+      }
+    }
+    if (model === "mealy" && r.z === "1") zT.ones.push(m);
+  }
+
+  // Every (state, input) combination that never appears is a don't care.
+  for (let m = 0; m < 1 << numVars; m++) {
+    if (covered.has(m)) continue;
+    for (let b = 0; b < n; b++) {
+      jT[b].dcs.push(m);
+      kT[b].dcs.push(m);
+      tT[b].dcs.push(m);
+    }
+    if (model === "mealy") zT.dcs.push(m);
+  }
+
+  // Moore output is a function of the state bits only.
+  let zVars = vars;
+  if (model === "moore") {
+    zVars = qNames;
+    const zCovered = new Set();
+    for (const s of states) {
+      const sRows = clean.filter((r) => r.ps === s);
+      const zVals = new Set(sRows.map((r) => r.z));
+      if (zVals.size > 1)
+        warnings.push(`State ${s}: ${zName} differs between rows — Moore output uses the first row.`);
+      const m = parseInt(codeOf.get(s), 2);
+      zCovered.add(m);
+      if (sRows[0].z === "1") zT.ones.push(m);
+    }
+    for (let m = 0; m < 1 << n; m++) if (!zCovered.has(m)) zT.dcs.push(m);
+  }
+
+  const equations = [];
+  for (let b = 0; b < n; b++) {
+    const bit = qNames[b].slice(1);
+    if (ffType === "jk") {
+      equations.push({
+        ff: `FF${bit}`,
+        name: `J${bit}`,
+        vars,
+        result: qmSimplify(numVars, jT[b].ones, jT[b].dcs),
+        table: jT[b],
+      });
+      equations.push({
+        ff: `FF${bit}`,
+        name: `K${bit}`,
+        vars,
+        result: qmSimplify(numVars, kT[b].ones, kT[b].dcs),
+        table: kT[b],
+      });
+    } else {
+      equations.push({
+        ff: `FF${bit}`,
+        name: `T${bit}`,
+        vars,
+        result: qmSimplify(numVars, tT[b].ones, tT[b].dcs),
+        table: tT[b],
+      });
+    }
+  }
+  const zEq = {
+    ff: "—",
+    name: zName,
+    vars: zVars,
+    result: qmSimplify(zVars.length, zT.ones, zT.dcs),
+    table: zT,
+  };
+
+  return {
+    ok: true,
+    errors,
+    warnings,
+    states,
+    codeOf,
+    n,
+    qNames,
+    xName,
+    zName,
+    model,
+    ffType,
+    equations,
+    zEq,
+    cleanRows: clean,
+  };
+}
+
+/* ------------------------------ UI atoms ---------------------------------- */
+
+const TERM_COLORS = [
+  "bg-amber-100 ring-2 ring-inset ring-amber-400 text-amber-800",
+  "bg-sky-100 ring-2 ring-inset ring-sky-400 text-sky-800",
+  "bg-emerald-100 ring-2 ring-inset ring-emerald-400 text-emerald-800",
+  "bg-fuchsia-100 ring-2 ring-inset ring-fuchsia-400 text-fuchsia-800",
+  "bg-orange-100 ring-2 ring-inset ring-orange-400 text-orange-800",
+  "bg-violet-100 ring-2 ring-inset ring-violet-400 text-violet-800",
+];
+
+function Card({ title, headerRight, className = "", children }) {
+  return (
+    <div className={`rounded-lg border border-slate-200 bg-white p-4 shadow-sm ${className}`}>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">{title}</h3>
+        {headerRight}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Radio({ name, label, desc, checked, onChange }) {
+  return (
+    <label
+      className={`flex cursor-pointer items-start gap-2.5 rounded-md border px-3 py-2 transition ${
+        checked ? "border-indigo-300 bg-indigo-50/60" : "border-slate-200 hover:bg-slate-50"
+      }`}
+    >
+      <input type="radio" name={name} checked={checked} onChange={onChange} className="mt-1 accent-indigo-600" />
+      <span>
+        <span className="block text-sm font-medium text-slate-700">{label}</span>
+        {desc && <span className="block text-xs text-slate-400">{desc}</span>}
+      </span>
+    </label>
+  );
+}
+
+function IconButton({ title, onClick, children }) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className="rounded-md border border-slate-200 bg-white p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+    >
+      {children}
+    </button>
+  );
+}
+
+function Expr({ result, vars }) {
+  if (result.kind === "zero") return <span className="font-mono">0</span>;
+  if (result.kind === "one") return <span className="font-mono">1</span>;
+  return (
+    <span className="font-mono">
+      {result.terms.map((t, i) => {
+        const lits = [];
+        for (let k = 0; k < t.length; k++) {
+          if (t[k] === "-") continue;
+          if (lits.length) lits.push("·");
+          lits.push(
+            <span key={k} className={t[k] === "0" ? "overline" : ""}>
+              {vars[k]}
+            </span>
+          );
+        }
+        return (
+          <span key={i}>
+            {i > 0 && " + "}
+            {lits}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/* -------------------------------- K-Map ----------------------------------- */
+
+function KMapView({ fn }) {
+  const numVars = fn.vars.length;
+  if (numVars < 2 || numVars > 4) {
+    return <p className="text-center text-xs text-slate-400">K-Map is shown for 2&ndash;4 variables.</p>;
+  }
+  const rv = numVars <= 3 ? 1 : 2;
+  const rowVars = fn.vars.slice(0, rv);
+  const colVars = fn.vars.slice(rv);
+  const rows = grayCodes(rv);
+  const cols = grayCodes(numVars - rv);
+
+  const valueOf = (m) => (fn.table.ones.includes(m) ? "1" : fn.table.dcs.includes(m) ? "d" : "0");
+  const colorOf = (m) => {
+    if (fn.result.kind !== "sop") return "";
+    const bits = m.toString(2).padStart(numVars, "0");
+    const idx = fn.result.terms.findIndex((t) => implicantCovers(t, bits));
+    return idx === -1 ? "" : TERM_COLORS[idx % TERM_COLORS.length];
+  };
+
+  const header = "border border-slate-300 bg-slate-100 text-[10px] font-semibold text-slate-500";
+  const box = "flex h-10 items-center justify-center";
+
+  return (
+    <div className="flex flex-col items-center gap-3">
+      <p className="text-xs text-slate-500">
+        K-Map for <span className="font-mono font-semibold text-slate-700">{fn.name}</span>
+        {" = "}
+        <Expr result={fn.result} vars={fn.vars} />
+      </p>
+      <div
+        className="grid text-center"
+        style={{ gridTemplateColumns: `3.5rem repeat(${cols.length}, 2.75rem)` }}
+      >
+        <div className={`${header} ${box}`}>
+          {rowVars.join("")} \ {colVars.join("")}
+        </div>
+        {cols.map((c) => (
+          <div key={c} className={`${header} ${box} font-mono`}>
+            {c}
+          </div>
+        ))}
+        {rows.map((r) => (
+          <div key={r} className="contents">
+            <div className={`${header} ${box} font-mono`}>{r}</div>
+            {cols.map((c) => {
+              const m = parseInt(r + c, 2);
+              const v = valueOf(m);
+              const hot = v !== "0" ? colorOf(m) : "";
+              return (
+                <div
+                  key={c}
+                  className={`border border-slate-300 font-mono text-sm ${box} ${
+                    hot || (v === "d" ? "text-slate-300" : "text-slate-600")
+                  }`}
+                >
+                  {v}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+      {fn.result.kind === "sop" && (
+        <div className="flex flex-wrap justify-center gap-1.5">
+          {fn.result.terms.map((t, i) => (
+            <span
+              key={t}
+              className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${TERM_COLORS[i % TERM_COLORS.length]}`}
+            >
+              {termToText(t, fn.vars)}
+            </span>
+          ))}
+        </div>
+      )}
+      <p className="text-[10px] text-slate-400">d = don&apos;t care &middot; colors mark the chosen prime implicants</p>
+    </div>
+  );
+}
+
+/* --------------------------- Circuit schematic ---------------------------- */
+
+function AndGateN({ x, y }) {
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <path d="M0 0 H24 A20 20 0 0 1 24 40 H0 Z" fill="white" stroke="#334155" strokeWidth="1.5" />
+    </g>
+  );
+}
+
+function OrGateN({ x, y, h }) {
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <path
+        d={`M0 0 Q14 ${h / 2} 0 ${h} Q24 ${h} 40 ${h / 2} Q24 0 0 0 Z`}
+        fill="white"
+        stroke="#334155"
+        strokeWidth="1.5"
+      />
+    </g>
+  );
+}
+
+function FFBlock({ x, y, ffType, label }) {
+  return (
+    <g transform={`translate(${x},${y})`} fontFamily="ui-monospace, monospace">
+      <rect width="76" height="96" rx="4" fill="white" stroke="#334155" strokeWidth="1.5" />
+      <polygon points="0,42 9,48 0,54" fill="none" stroke="#334155" strokeWidth="1.2" />
+      <text x="8" y="24" fontSize="11" fill="#334155">{ffType === "jk" ? "J" : "T"}</text>
+      <text x="13" y="51" fontSize="8" fill="#334155">CLK</text>
+      {ffType === "jk" && <text x="8" y="82" fontSize="11" fill="#334155">K</text>}
+      <text x="68" y="24" fontSize="11" textAnchor="end" fill="#334155">Q</text>
+      <text x="68" y="82" fontSize="11" textAnchor="end" fill="#334155">Q&#8242;</text>
+      <text x="38" y="112" fontSize="10" textAnchor="middle" fill="#64748b">{label}</text>
+    </g>
+  );
+}
+
+function CircuitDiagram({ design, zoom, svgRef }) {
+  if (!design?.ok) {
+    return (
+      <p className="px-6 text-center text-xs text-slate-400">
+        Enter a valid state table and press GENERATE to draw the circuit.
+      </p>
+    );
+  }
+
+  const { equations, zEq, ffType, qNames, xName, zName, n } = design;
+  const allEqs = [...equations, zEq];
+
+  // Vertical input rails: one per literal actually used by any equation.
+  const usedLits = new Set();
+  for (const eq of allEqs) {
+    if (eq.result.kind !== "sop") continue;
+    for (const t of eq.result.terms) {
+      for (let k = 0; k < t.length; k++) {
+        if (t[k] !== "-") usedLits.add(eq.vars[k] + "|" + t[k]);
+      }
+    }
+  }
+  const railDefs = [];
+  for (const v of [xName, ...qNames]) {
+    if (usedLits.has(v + "|1")) railDefs.push({ v, bit: "1" });
+    if (usedLits.has(v + "|0")) railDefs.push({ v, bit: "0" });
+  }
+  const railX = new Map(railDefs.map((r, i) => [r.v + "|" + r.bit, 34 + i * 24]));
+
+  const AND_W = 44;
+  const OR_W = 40;
+  const andX = 34 + railDefs.length * 24 + 22;
+  const orX = andX + AND_W + 28;
+  const xOut = orX + OR_W;
+  const elbow = xOut + 18;
+  const clkX = elbow + 14;
+  const ffX = clkX + 16;
+
+  const SLOT = 46;
+  const wires = [];
+  const dots = [];
+  const shapes = [];
+  const texts = [];
+  let key = 0;
+  const wire = (pts) =>
+    wires.push(<polyline key={key++} points={pts} fill="none" stroke="#64748b" strokeWidth="1.5" />);
+  const dot = (x, y) => dots.push(<circle key={key++} cx={x} cy={y} r="2.4" fill="#64748b" />);
+
+  // Lay out one signal (an SOP network) starting at yStart; returns its
+  // output point so the caller can route it into a flip-flop pin.
+  const emitSignal = (eq, yStart) => {
+    const r = eq.result;
+    if (r.kind !== "sop") {
+      return { constant: r.kind === "one" ? "1" : "0", pinY: yStart + 20, height: 40 };
+    }
+    const terms = r.terms;
+    const outs = [];
+    terms.forEach((t, i) => {
+      const slotTop = yStart + i * SLOT;
+      const lits = [];
+      for (let k = 0; k < t.length; k++) {
+        if (t[k] !== "-") lits.push(eq.vars[k] + "|" + t[k]);
+      }
+      if (lits.length >= 2) {
+        const gy = slotTop + (SLOT - 40) / 2;
+        shapes.push(<AndGateN key={key++} x={andX} y={gy} />);
+        lits.forEach((lit, j) => {
+          const iy = gy + (40 * (j + 1)) / (lits.length + 1);
+          const rx = railX.get(lit);
+          wire(`${rx},${iy} ${andX},${iy}`);
+          dot(rx, iy);
+        });
+        outs.push({ x: andX + AND_W, y: gy + 20 });
+      } else {
+        const iy = slotTop + SLOT / 2;
+        outs.push({ x: railX.get(lits[0]), y: iy, fromRail: true });
+      }
+    });
+
+    let out;
+    if (terms.length === 1) {
+      const o = outs[0];
+      wire(`${o.x},${o.y} ${xOut},${o.y}`);
+      if (o.fromRail) dot(o.x, o.y);
+      out = { x: xOut, y: o.y };
+    } else {
+      const k = terms.length;
+      const orH = Math.max(40, k * 14 + 8);
+      const cy = (outs[0].y + outs[k - 1].y) / 2;
+      const oy = cy - orH / 2;
+      shapes.push(<OrGateN key={key++} x={orX} y={oy} h={orH} />);
+      outs.forEach((o, j) => {
+        const iy = oy + (orH * (j + 1)) / (k + 1);
+        const midX = andX + AND_W + 8 + j * 5;
+        wire(`${o.x},${o.y} ${midX},${o.y} ${midX},${iy} ${orX + 5},${iy}`);
+        if (o.fromRail) dot(o.x, o.y);
+      });
+      wire(`${orX + OR_W},${cy} ${xOut},${cy}`);
+      out = { x: xOut, y: cy };
+    }
+    return { pinY: out.y, height: Math.max(terms.length * SLOT, 50), outX: out.x };
+  };
+
+  const routePin = (sig, pinTargetY) => {
+    if (sig.constant) {
+      texts.push(
+        <text key={key++} x={ffX - 8} y={pinTargetY + 4} fontSize="11" textAnchor="end" fill="#334155" fontFamily="ui-monospace, monospace">
+          {sig.constant}
+        </text>
+      );
+      wire(`${ffX - 6},${pinTargetY} ${ffX},${pinTargetY}`);
+    } else {
+      wire(`${sig.outX},${sig.pinY} ${elbow},${sig.pinY} ${elbow},${pinTargetY} ${ffX},${pinTargetY}`);
+    }
+  };
+
+  let y = 26;
+  const clkYs = [];
+  for (let b = 0; b < n; b++) {
+    const bitName = qNames[b];
+    let ffY;
+    if (ffType === "jk") {
+      const jSig = emitSignal(equations[2 * b], y);
+      let y2 = y + jSig.height + 8;
+      const kSig = emitSignal(equations[2 * b + 1], y2);
+      y = y2 + kSig.height;
+      ffY = (jSig.pinY + kSig.pinY) / 2 - 48;
+      routePin(jSig, ffY + 18);
+      routePin(kSig, ffY + 78);
+    } else {
+      const tSig = emitSignal(equations[b], y);
+      y += tSig.height;
+      ffY = tSig.pinY - 18;
+      routePin(tSig, ffY + 18);
+    }
+    shapes.push(
+      <FFBlock key={key++} x={ffX} y={ffY} ffType={ffType} label={`${ffType.toUpperCase()}-FF (${bitName})`} />
+    );
+    // Q / Q' output stubs — these drive the Q rails on the left (by label).
+    wire(`${ffX + 76},${ffY + 20} ${ffX + 92},${ffY + 20}`);
+    wire(`${ffX + 76},${ffY + 78} ${ffX + 92},${ffY + 78}`);
+    texts.push(
+      <text key={key++} x={ffX + 96} y={ffY + 24} fontSize="10" fill="#334155" fontFamily="ui-monospace, monospace">
+        {bitName}
+      </text>,
+      <text key={key++} x={ffX + 96} y={ffY + 82} fontSize="10" fill="#334155" fontFamily="ui-monospace, monospace">
+        {bitName}&#8242;
+      </text>
+    );
+    wire(`${clkX},${ffY + 48} ${ffX},${ffY + 48}`);
+    clkYs.push(ffY + 48);
+    y = Math.max(y, ffY + 96 + 30) + 14;
+  }
+
+  // Output network
+  const zSig = emitSignal(zEq, y);
+  if (zSig.constant) {
+    texts.push(
+      <text key={key++} x={andX} y={zSig.pinY + 4} fontSize="11" fill="#334155" fontFamily="ui-monospace, monospace">
+        {zName} = {zSig.constant}
+      </text>
+    );
+  } else {
+    wire(`${xOut},${zSig.pinY} ${ffX + 24},${zSig.pinY}`);
+    texts.push(
+      <text key={key++} x={ffX + 30} y={zSig.pinY + 4} fontSize="12" fill="#334155" fontFamily="ui-monospace, monospace">
+        {zName}
+      </text>
+    );
+  }
+  y += zSig.height + 10;
+
+  // Clock rail
+  const clkBottom = y + 6;
+  if (clkYs.length) {
+    wire(`${clkX},${clkBottom} ${clkX},${Math.min(...clkYs)}`);
+    for (const cy of clkYs.slice(0, -1)) dot(clkX, cy);
+    texts.push(
+      <text key={key++} x={clkX} y={clkBottom + 14} fontSize="10" textAnchor="middle" fill="#334155" fontFamily="ui-monospace, monospace">
+        CLK
+      </text>
+    );
+  }
+
+  // Rails + labels
+  const railShapes = railDefs.map((r, i) => {
+    const x = 34 + i * 24;
+    return (
+      <g key={i}>
+        <line x1={x} y1={20} x2={x} y2={clkBottom - 30} stroke="#94a3b8" strokeWidth="1.2" />
+        <text x={x} y={12} fontSize="10" textAnchor="middle" fill="#334155" fontFamily="ui-monospace, monospace">
+          {r.v}
+          {r.bit === "0" ? "′" : ""}
+        </text>
+      </g>
+    );
+  });
+
+  const width = ffX + 76 + 70;
+  const height = clkBottom + 24;
+
+  return (
+    <svg
+      ref={svgRef}
+      width={width * zoom}
+      height={height * zoom}
+      viewBox={`0 0 ${width} ${height}`}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      {railShapes}
+      {wires}
+      {dots}
+      {shapes}
+      {texts}
+    </svg>
+  );
+}
+
+/* ---------------------------------- App ----------------------------------- */
+
+export default function App() {
+  const [model, setModel] = useState("mealy");
+  const [ffType, setFfType] = useState("jk");
+  const [inputVars, setInputVars] = useState("X");
+  const [outputVars, setOutputVars] = useState("Z");
+  const [rows, setRows] = useState(EXAMPLE_ROWS);
+  const [design, setDesign] = useState(null);
+  const [genKey, setGenKey] = useState("");
+  const [selectedFn, setSelectedFn] = useState("");
+  const [zoom, setZoom] = useState(1);
+  const [status, setStatus] = useState("");
+  const canvasRef = useRef(null);
+  const svgRef = useRef(null);
+  const toastTimer = useRef(null);
+
+  const xName = inputVars.trim().split(/[\s,]+/)[0] || "X";
+  const zName = outputVars.trim().split(/[\s,]+/)[0] || "Z";
+  const configKey = JSON.stringify({ rows, model, ffType, xName, zName });
+  const stale = design && genKey !== configKey;
+
+  const showToast = (message) => {
+    setStatus(message);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setStatus(""), 2500);
+  };
+
+  const generate = (silent = false) => {
+    const d = designCircuit(rows, model, ffType, xName, zName);
+    setDesign(d);
+    setGenKey(JSON.stringify({ rows, model, ffType, xName, zName }));
+    if (d.ok) {
+      const names = [...d.equations.map((e) => e.name), d.zEq.name];
+      setSelectedFn((prev) => (names.includes(prev) ? prev : names[0]));
+      if (!silent) showToast("Generation complete — outputs updated.");
+    } else if (!silent) {
+      showToast("Generation failed — check the input errors.");
+    }
+  };
+
+  // Compute the example once on first load.
+  useEffect(() => {
+    generate(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const updateRow = (i, field, value) => {
+    setRows(rows.map((r, j) => (j === i ? { ...r, [field]: value } : r)));
+  };
+
+  const handleDownload = () => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const blob = new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "sequential-circuit.svg";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExport = () => {
+    if (!design?.ok) {
+      showToast("Fix the errors and press GENERATE first.");
+      return;
+    }
+    const d = design;
+    const lines = [
+      "SEQUENTIAL CIRCUIT DESIGN REPORT",
+      `Generated: ${new Date().toLocaleString()}`,
+      "",
+      `Model: ${d.model === "mealy" ? "Mealy" : "Moore"}`,
+      `Flip-Flop type: ${d.ffType === "jk" ? "JK" : "T"}`,
+      `State variables: ${d.qNames.join(" ")}`,
+      "",
+      "State assignment:",
+      ...d.states.map((s) => `  ${s} = ${d.codeOf.get(s)}`),
+      "",
+      `State table (Present, ${d.xName}, Next, ${d.zName}):`,
+      ...d.cleanRows.map((r) => `  ${r.ps}  ${r.x}  ${r.ns}  ${r.z}`),
+      "",
+      "Simplified flip-flop input equations:",
+      ...d.equations.map((e) => `  ${e.name} = ${exprToText(e.result, e.vars)}`),
+      "",
+      `Output equation (${d.model === "mealy" ? "Mealy" : "Moore"}):`,
+      `  ${d.zEq.name} = ${exprToText(d.zEq.result, d.zEq.vars)}`,
+      "",
+    ];
+    const blob = new Blob([lines.join("\r\n")], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "design-report.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("Report exported.");
+  };
+
+  const allFns = design?.ok ? [...design.equations, design.zEq] : [];
+  const currentFn = allFns.find((f) => f.name === selectedFn) || allFns[0];
+
+  const inputClass =
+    "w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-sm focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-400";
+  const smallButton = "rounded-md border px-3 py-1.5 text-xs font-semibold transition";
+  const th =
+    "border border-slate-200 bg-slate-100 px-2 py-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500";
+  const td = "border border-slate-200 px-1 py-0.5 text-center font-mono text-slate-700";
+  const cellInput = "w-full bg-transparent px-1 py-1 text-center font-mono text-sm focus:outline-none focus:bg-indigo-50";
+
+  return (
+    <div className="flex min-h-screen flex-col bg-slate-100 text-slate-800">
+      {/* ------------------------------ Header ------------------------------ */}
+      <header className="flex items-center justify-between bg-slate-800 px-4 py-2.5 text-slate-100 shadow">
+        <div className="flex items-center gap-2.5">
+          <Cpu size={20} className="text-sky-400" />
+          <h1 className="text-sm font-semibold tracking-wide sm:text-base">
+            Sequential Circuit Design Automation System
+          </h1>
+        </div>
+        <div className="flex items-center gap-1">
+          <button type="button" title="Minimize" className="rounded p-1.5 text-slate-300 transition hover:bg-slate-700 hover:text-white">
+            <Minus size={14} />
+          </button>
+          <button type="button" title="Maximize" className="rounded p-1.5 text-slate-300 transition hover:bg-slate-700 hover:text-white">
+            <Square size={12} />
+          </button>
+          <button type="button" title="Close" className="rounded p-1.5 text-slate-300 transition hover:bg-red-600 hover:text-white">
+            <X size={14} />
+          </button>
+        </div>
+      </header>
+
+      {/* --------------------------- Three columns --------------------------- */}
+      <main className="mx-auto grid w-full max-w-[1400px] flex-1 grid-cols-1 gap-4 p-4 lg:grid-cols-3">
+        {/* Left — input (pale red border) */}
+        <section className="space-y-4 rounded-xl border border-red-300 bg-red-50/40 p-3">
+          <Card title="1. Model Type">
+            <div className="space-y-2">
+              <Radio
+                name="model"
+                label="Mealy Model"
+                desc="Output depends on present state and input"
+                checked={model === "mealy"}
+                onChange={() => setModel("mealy")}
+              />
+              <Radio
+                name="model"
+                label="Moore Model"
+                desc="Output depends on present state only"
+                checked={model === "moore"}
+                onChange={() => setModel("moore")}
+              />
+            </div>
+          </Card>
+
+          <Card title="2. Flip-Flop Type">
+            <div className="space-y-2">
+              <Radio
+                name="ff"
+                label="JK Flip-Flop"
+                desc="Excitation inputs J / K per state variable"
+                checked={ffType === "jk"}
+                onChange={() => setFfType("jk")}
+              />
+              <Radio
+                name="ff"
+                label="T Flip-Flop"
+                desc="Single toggle input T per state variable"
+                checked={ffType === "t"}
+                onChange={() => setFfType("t")}
+              />
+            </div>
+          </Card>
+
+          <Card title="3. State Table Input">
+            <div className="mb-3 grid grid-cols-2 gap-2">
+              <label>
+                <span className="mb-1 block text-xs font-medium text-slate-500">Input Variables</span>
+                <input value={inputVars} onChange={(e) => setInputVars(e.target.value)} className={inputClass} />
+              </label>
+              <label>
+                <span className="mb-1 block text-xs font-medium text-slate-500">Output Variables</span>
+                <input value={outputVars} onChange={(e) => setOutputVars(e.target.value)} className={inputClass} />
+              </label>
+            </div>
+
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr>
+                  <th className={th}>Present State</th>
+                  <th className={th}>{xName}</th>
+                  <th className={th}>Next State</th>
+                  <th className={th}>{zName}</th>
+                  <th className={`${th} w-8`}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, i) => (
+                  <tr key={i} className="odd:bg-white even:bg-slate-50">
+                    <td className={td}>
+                      <input value={row.ps} onChange={(e) => updateRow(i, "ps", e.target.value)} className={cellInput} />
+                    </td>
+                    <td className={td}>
+                      <select value={row.x} onChange={(e) => updateRow(i, "x", e.target.value)} className={cellInput}>
+                        <option>0</option>
+                        <option>1</option>
+                      </select>
+                    </td>
+                    <td className={td}>
+                      <input value={row.ns} onChange={(e) => updateRow(i, "ns", e.target.value)} className={cellInput} />
+                    </td>
+                    <td className={td}>
+                      <select value={row.z} onChange={(e) => updateRow(i, "z", e.target.value)} className={cellInput}>
+                        <option>0</option>
+                        <option>1</option>
+                      </select>
+                    </td>
+                    <td className={td}>
+                      <button
+                        type="button"
+                        title="Delete row"
+                        onClick={() => setRows(rows.filter((_, j) => j !== i))}
+                        className="rounded p-1 text-slate-300 transition hover:bg-red-50 hover:text-red-500"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {rows.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="border border-slate-200 px-2 py-6 text-center text-xs text-slate-400">
+                      Table is empty — click &quot;Load Example&quot; or &quot;Add Row&quot;.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setRows([...rows, { ps: "", x: "0", ns: "", z: "0" }])}
+                className={`${smallButton} flex items-center gap-1 border-slate-300 bg-white text-slate-600 hover:bg-slate-100`}
+              >
+                <Plus size={13} /> Add Row
+              </button>
+              <button
+                type="button"
+                onClick={() => setRows([])}
+                className={`${smallButton} border-slate-300 bg-white text-slate-600 hover:bg-slate-100`}
+              >
+                Clear Table
+              </button>
+              <button
+                type="button"
+                onClick={() => setRows(EXAMPLE_ROWS)}
+                className={`${smallButton} border-indigo-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100`}
+              >
+                Load Example
+              </button>
+            </div>
+          </Card>
+        </section>
+
+        {/* Middle — results (pale blue border) */}
+        <section className="space-y-4 rounded-xl border border-sky-300 bg-sky-50/40 p-3">
+          <Card
+            title="Output 1: Flip-Flop Input Equations"
+            headerRight={
+              <span className="rounded bg-sky-100 px-2 py-0.5 font-mono text-[10px] font-semibold text-sky-700">
+                State Variables: {design?.ok ? design.qNames.join(" ") : "—"}
+              </span>
+            }
+          >
+            {stale && (
+              <p className="mb-2 flex items-center gap-1.5 rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-700">
+                <AlertTriangle size={13} /> Inputs changed — press GENERATE to update the outputs.
+              </p>
+            )}
+
+            {design && !design.ok && (
+              <ul className="mb-3 space-y-1 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-600">
+                {design.errors.map((e, i) => (
+                  <li key={i} className="flex items-start gap-1.5">
+                    <AlertTriangle size={13} className="mt-0.5 shrink-0" /> {e}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {design?.ok && (
+              <>
+                {design.warnings.length > 0 && (
+                  <ul className="mb-3 space-y-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700">
+                    {design.warnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mb-2 text-sm font-medium text-slate-600">Flip-Flop Input Equations (Simplified)</p>
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {design.states.map((s) => (
+                    <span key={s} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600">
+                      {s} = {design.codeOf.get(s)}
+                    </span>
+                  ))}
+                </div>
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr>
+                      <th className={th}>Flip-Flop</th>
+                      <th className={th}>Input</th>
+                      <th className={th}>Equation</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {design.equations.map((row) => (
+                      <tr key={row.name} className="odd:bg-white even:bg-slate-50">
+                        <td className={`${td} py-1.5`}>{row.ff}</td>
+                        <td className={`${td} py-1.5`}>{row.name}</td>
+                        <td className={`${td} py-1.5 text-indigo-700`}>
+                          {row.name} = <Expr result={row.result} vars={row.vars} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="mt-2 text-xs text-slate-400">
+                  Output equation:{" "}
+                  <span className="font-mono text-slate-600">
+                    {design.zEq.name} = <Expr result={design.zEq.result} vars={design.zEq.vars} />
+                  </span>{" "}
+                  ({design.model === "mealy" ? "Mealy" : "Moore"} model)
+                </p>
+              </>
+            )}
+          </Card>
+
+          <Card
+            title="K-Map (Live)"
+            headerRight={
+              design?.ok && (
+                <select
+                  value={currentFn?.name || ""}
+                  onChange={(e) => setSelectedFn(e.target.value)}
+                  className="rounded-md border border-slate-300 px-2 py-1 font-mono text-xs focus:border-indigo-400 focus:outline-none"
+                >
+                  {allFns.map((f) => (
+                    <option key={f.name} value={f.name}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              )
+            }
+          >
+            {design?.ok && currentFn ? (
+              <KMapView fn={currentFn} />
+            ) : (
+              <p className="py-4 text-center text-xs text-slate-400">Press GENERATE to compute the K-Map.</p>
+            )}
+          </Card>
+        </section>
+
+        {/* Right — circuit diagram (pale green border) */}
+        <section className="flex rounded-xl border border-emerald-300 bg-emerald-50/40 p-3">
+          <Card
+            title="Output 2: Sequential Circuit Diagram"
+            className="flex h-full w-full flex-col"
+            headerRight={
+              <div className="flex items-center gap-1">
+                <IconButton title="Zoom in" onClick={() => setZoom((z) => Math.min(2, +(z + 0.2).toFixed(2)))}>
+                  <ZoomIn size={15} />
+                </IconButton>
+                <IconButton title="Zoom out" onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.2).toFixed(2)))}>
+                  <ZoomOut size={15} />
+                </IconButton>
+                <span className="px-1 text-xs tabular-nums text-slate-400">{Math.round(zoom * 100)}%</span>
+                <IconButton title="Fullscreen" onClick={() => canvasRef.current?.requestFullscreen?.()}>
+                  <Maximize size={15} />
+                </IconButton>
+                <IconButton title="Download SVG" onClick={handleDownload}>
+                  <Download size={15} />
+                </IconButton>
+              </div>
+            }
+          >
+            <div
+              ref={canvasRef}
+              className="min-h-[340px] flex-1 overflow-auto rounded-md border border-slate-200 bg-white bg-[radial-gradient(circle,#dbe2ea_1px,transparent_1px)] bg-[size:16px_16px]"
+            >
+              <div className="flex min-h-full min-w-full items-center justify-center p-2">
+                <CircuitDiagram design={design} zoom={zoom} svgRef={svgRef} />
+              </div>
+            </div>
+            <p className="mt-2 text-center text-xs italic text-slate-400">
+              Circuit diagram is generated based on simplified equations. Q / Q&#8242; rails are driven by the
+              flip-flop outputs.
+            </p>
+          </Card>
+        </section>
+      </main>
+
+      {/* ------------------------------ Footer ------------------------------ */}
+      <footer className="border-t border-slate-200 bg-white px-4 py-3">
+        <div className="mx-auto flex w-full max-w-[1400px] flex-col items-center gap-3 sm:flex-row">
+          <div className="flex flex-1 items-center justify-center sm:justify-start">
+            <button
+              type="button"
+              className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+            >
+              <Settings size={16} />
+              Settings
+            </button>
+          </div>
+
+          <div className="flex flex-1 flex-col items-center gap-1">
+            <button
+              type="button"
+              onClick={() => generate()}
+              className={`flex items-center gap-2 rounded-lg px-10 py-2.5 text-sm font-bold tracking-widest text-white shadow-md transition active:scale-95 ${
+                stale ? "bg-amber-500 hover:bg-amber-600" : "bg-indigo-600 hover:bg-indigo-700"
+              }`}
+            >
+              <Play size={16} />
+              GENERATE
+            </button>
+            {stale && <span className="text-[10px] text-amber-600">inputs changed</span>}
+          </div>
+
+          <div className="flex flex-1 items-center justify-center gap-3 sm:justify-end">
+            <button
+              type="button"
+              onClick={handleExport}
+              className="flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100"
+            >
+              <FileText size={14} />
+              EXPORT REPORT
+            </button>
+            <a
+              href="#about"
+              title="About"
+              className="rounded-md p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+            >
+              <Info size={18} />
+            </a>
+          </div>
+        </div>
+      </footer>
+
+      {/* Toast */}
+      {status && (
+        <div className="fixed bottom-20 right-6 rounded-lg bg-emerald-600 px-4 py-2 text-sm text-white shadow-lg">
+          {status}
+        </div>
+      )}
+    </div>
+  );
+}
