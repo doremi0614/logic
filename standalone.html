@@ -468,6 +468,212 @@ function KMapView({ fn }) {
   );
 }
 
+/* ------------------------ State transition diagram ------------------------ */
+/* Drawn live from the raw state table — circles are states, arrows are      */
+/* transitions. Mealy labels edges with "input/output"; Moore labels edges   */
+/* with the input and shows the output inside each state bubble.             */
+
+function StateDiagram({ rows, model, xName, zName, svgRef }) {
+  const clean = rows
+    .map((r) => ({ ps: r.ps.trim(), x: r.x.trim(), ns: r.ns.trim(), z: r.z.trim() }))
+    .filter((r) => r.ps || r.ns);
+
+  const states = [];
+  for (const r of clean) if (r.ps && !states.includes(r.ps)) states.push(r.ps);
+  const defined = new Set(states);
+  for (const r of clean) if (r.ns && !states.includes(r.ns)) states.push(r.ns);
+
+  if (states.length === 0) {
+    return (
+      <p className="py-6 text-center text-xs text-slate-400">
+        Add rows to the state table to see the diagram.
+      </p>
+    );
+  }
+
+  const N = states.length;
+  const nodeR = 24;
+  const R = N === 1 ? 0 : 62 + N * 13;
+  const margin = 58;
+  const size = 2 * (R + nodeR + margin);
+  const c = size / 2;
+
+  const pos = new Map(
+    states.map((s, i) => {
+      const a = -Math.PI / 2 + (2 * Math.PI * i) / N;
+      return [s, { x: c + R * Math.cos(a), y: c + R * Math.sin(a), a }];
+    })
+  );
+
+  // One edge per (from, to) pair; multiple table rows merge into one label.
+  const groups = new Map();
+  for (const r of clean) {
+    if (!r.ps || !r.ns) continue;
+    const key = r.ps + "|" + r.ns;
+    const label = model === "mealy" ? `${r.x}/${r.z}` : r.x;
+    if (!groups.has(key)) groups.set(key, { from: r.ps, to: r.ns, labels: [] });
+    groups.get(key).labels.push(label);
+  }
+
+  const mooreOut = new Map();
+  if (model === "moore") {
+    for (const s of states) {
+      const row = clean.find((r) => r.ps === s);
+      if (row) mooreOut.set(s, row.z);
+    }
+  }
+
+  const labelText = (x, y, label, key) => (
+    <text
+      key={key}
+      x={x}
+      y={y}
+      textAnchor="middle"
+      fontSize="11"
+      fontFamily="ui-monospace, monospace"
+      fill="#334155"
+      paintOrder="stroke"
+      stroke="white"
+      strokeWidth="3.5"
+    >
+      {label}
+    </text>
+  );
+
+  const edges = [];
+  let key = 0;
+  for (const g of groups.values()) {
+    const label = g.labels.join(", ");
+    if (g.from === g.to) {
+      // Self-loop: a small arc bulging away from the diagram center.
+      const p = pos.get(g.from);
+      const a1 = p.a - 0.7;
+      const a2 = p.a + 0.7;
+      const sx = p.x + nodeR * Math.cos(a1);
+      const sy = p.y + nodeR * Math.sin(a1);
+      const ex = p.x + nodeR * Math.cos(a2);
+      const ey = p.y + nodeR * Math.sin(a2);
+      edges.push(
+        <path
+          key={key++}
+          d={`M ${sx} ${sy} A 17 17 0 1 1 ${ex} ${ey}`}
+          fill="none"
+          stroke="#64748b"
+          strokeWidth="1.5"
+          markerEnd="url(#sd-arrow)"
+        />,
+        labelText(p.x + (nodeR + 42) * Math.cos(p.a), p.y + (nodeR + 42) * Math.sin(p.a) + 4, label, key++)
+      );
+    } else {
+      // Curved edge; pairs of opposite edges bend to opposite sides.
+      const p1 = pos.get(g.from);
+      const p2 = pos.get(g.to);
+      const hasReverse = groups.has(g.to + "|" + g.from);
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const bend = hasReverse ? 26 : 12;
+      const cx = (p1.x + p2.x) / 2 + (dy / len) * bend;
+      const cy = (p1.y + p2.y) / 2 - (dx / len) * bend;
+      const d1 = Math.hypot(cx - p1.x, cy - p1.y) || 1;
+      const sx = p1.x + ((cx - p1.x) / d1) * nodeR;
+      const sy = p1.y + ((cy - p1.y) / d1) * nodeR;
+      const d2 = Math.hypot(p2.x - cx, p2.y - cy) || 1;
+      const ex = p2.x - ((p2.x - cx) / d2) * (nodeR + 3);
+      const ey = p2.y - ((p2.y - cy) / d2) * (nodeR + 3);
+      // Quadratic bezier midpoint (t = 0.5) for the label position.
+      const lx = (sx + 2 * cx + ex) / 4;
+      const ly = (sy + 2 * cy + ey) / 4;
+      edges.push(
+        <path
+          key={key++}
+          d={`M ${sx} ${sy} Q ${cx} ${cy} ${ex} ${ey}`}
+          fill="none"
+          stroke="#64748b"
+          strokeWidth="1.5"
+          markerEnd="url(#sd-arrow)"
+        />,
+        labelText(lx, ly + 4, label, key++)
+      );
+    }
+  }
+
+  // Reset arrow pointing at the initial state (first present state).
+  const s0 = pos.get(states[0]);
+  const sa = s0.a - 1.15;
+  const startArrow = (
+    <path
+      d={`M ${s0.x + Math.cos(sa) * (nodeR + 28)} ${s0.y + Math.sin(sa) * (nodeR + 28)} L ${
+        s0.x + Math.cos(sa) * (nodeR + 3)
+      } ${s0.y + Math.sin(sa) * (nodeR + 3)}`}
+      stroke="#334155"
+      strokeWidth="1.8"
+      markerEnd="url(#sd-arrow)"
+    />
+  );
+
+  return (
+    <div>
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${size} ${size}`}
+        xmlns="http://www.w3.org/2000/svg"
+        className="mx-auto block h-auto w-full max-w-[380px]"
+      >
+        <defs>
+          <marker id="sd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b" />
+          </marker>
+        </defs>
+        {edges}
+        {startArrow}
+        {states.map((s) => {
+          const p = pos.get(s);
+          const undef = !defined.has(s);
+          return (
+            <g key={s} fontFamily="ui-monospace, monospace">
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={nodeR}
+                fill={undef ? "#fef2f2" : "white"}
+                stroke={undef ? "#f87171" : "#334155"}
+                strokeWidth="1.5"
+                strokeDasharray={undef ? "4 3" : undefined}
+              />
+              {model === "moore" && mooreOut.has(s) ? (
+                <>
+                  <text x={p.x} y={p.y - 5} textAnchor="middle" fontSize="12" fontWeight="600" fill={undef ? "#dc2626" : "#334155"}>
+                    {s}
+                  </text>
+                  <line x1={p.x - nodeR + 7} y1={p.y} x2={p.x + nodeR - 7} y2={p.y} stroke="#94a3b8" strokeWidth="1" />
+                  <text x={p.x} y={p.y + 14} textAnchor="middle" fontSize="10" fill="#64748b">
+                    {mooreOut.get(s)}
+                  </text>
+                </>
+              ) : (
+                <text x={p.x} y={p.y + 4} textAnchor="middle" fontSize="13" fontWeight="600" fill={undef ? "#dc2626" : "#334155"}>
+                  {s}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      <p className="mt-1 text-center text-[10px] text-slate-400">
+        {model === "mealy"
+          ? `Edge label: ${xName} / ${zName} · updates live with the table`
+          : `Edge label: ${xName} · ${zName} shown inside each state · updates live with the table`}
+      </p>
+      {states.some((s) => !defined.has(s)) && (
+        <p className="mt-1 text-center text-[10px] text-red-500">
+          Dashed red states appear only as a next state — add rows for them.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* --------------------------- Circuit schematic ---------------------------- */
 
 function AndGateN({ x, y }) {
@@ -739,6 +945,7 @@ function App() {
   const [status, setStatus] = useState("");
   const canvasRef = useRef(null);
   const svgRef = useRef(null);
+  const stateSvgRef = useRef(null);
   const toastTimer = useRef(null);
 
   const xName = inputVars.trim().split(/[\s,]+/)[0] || "X";
@@ -775,14 +982,14 @@ function App() {
     setRows(rows.map((r, j) => (j === i ? { ...r, [field]: value } : r)));
   };
 
-  const handleDownload = () => {
-    const svg = svgRef.current;
+  const downloadSvg = (ref, filename) => {
+    const svg = ref.current;
     if (!svg) return;
     const blob = new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "sequential-circuit.svg";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -994,6 +1201,17 @@ function App() {
         {/* Middle — results (pale blue border) */}
         <section className="space-y-4 rounded-xl border border-sky-300 bg-sky-50/40 p-3">
           <Card
+            title="State Transition Diagram"
+            headerRight={
+              <IconButton title="Download SVG" onClick={() => downloadSvg(stateSvgRef, "state-diagram.svg")}>
+                <Download size={15} />
+              </IconButton>
+            }
+          >
+            <StateDiagram rows={rows} model={model} xName={xName} zName={zName} svgRef={stateSvgRef} />
+          </Card>
+
+          <Card
             title="Output 1: Flip-Flop Input Equations"
             headerRight={
               <span className="rounded bg-sky-100 px-2 py-0.5 font-mono text-[10px] font-semibold text-sky-700">
@@ -1108,7 +1326,7 @@ function App() {
                 <IconButton title="Fullscreen" onClick={() => canvasRef.current?.requestFullscreen?.()}>
                   <Maximize size={15} />
                 </IconButton>
-                <IconButton title="Download SVG" onClick={handleDownload}>
+                <IconButton title="Download SVG" onClick={() => downloadSvg(svgRef, "sequential-circuit.svg")}>
                   <Download size={15} />
                 </IconButton>
               </div>
