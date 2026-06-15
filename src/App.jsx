@@ -9,9 +9,9 @@ import {
   Minus,
   Play,
   Plus,
-  Settings,
   Square,
   Trash2,
+  User,
   X,
   ZoomIn,
   ZoomOut,
@@ -193,6 +193,7 @@ function designCircuit(rows, model, ffType, xName, zName) {
   const jT = Array.from({ length: n }, table);
   const kT = Array.from({ length: n }, table);
   const tT = Array.from({ length: n }, table);
+  const dT = Array.from({ length: n }, table);
   const zT = table();
   const covered = new Set();
 
@@ -213,9 +214,12 @@ function designCircuit(rows, model, ffType, xName, zName) {
           jT[b].dcs.push(m);
           if (nxt === "0") kT[b].ones.push(m);
         }
-      } else {
+      } else if (ffType === "t") {
         // T excitation: T = Q xor Q+
         if (cur !== nxt) tT[b].ones.push(m);
+      } else {
+        // D excitation: D = Q+ (next-state value)
+        if (nxt === "1") dT[b].ones.push(m);
       }
     }
     if (model === "mealy" && r.z === "1") zT.ones.push(m);
@@ -228,6 +232,7 @@ function designCircuit(rows, model, ffType, xName, zName) {
       jT[b].dcs.push(m);
       kT[b].dcs.push(m);
       tT[b].dcs.push(m);
+      dT[b].dcs.push(m);
     }
     if (model === "mealy") zT.dcs.push(m);
   }
@@ -267,13 +272,21 @@ function designCircuit(rows, model, ffType, xName, zName) {
         result: qmSimplify(numVars, kT[b].ones, kT[b].dcs),
         table: kT[b],
       });
-    } else {
+    } else if (ffType === "t") {
       equations.push({
         ff: `FF${bit}`,
         name: `T${bit}`,
         vars,
         result: qmSimplify(numVars, tT[b].ones, tT[b].dcs),
         table: tT[b],
+      });
+    } else {
+      equations.push({
+        ff: `FF${bit}`,
+        name: `D${bit}`,
+        vars,
+        result: qmSimplify(numVars, dT[b].ones, dT[b].dcs),
+        table: dT[b],
       });
     }
   }
@@ -697,7 +710,7 @@ function FFBlock({ x, y, ffType, label }) {
     <g transform={`translate(${x},${y})`} fontFamily="ui-monospace, monospace">
       <rect width="76" height="96" rx="4" fill="white" stroke="#334155" strokeWidth="1.5" />
       <polygon points="0,42 9,48 0,54" fill="none" stroke="#334155" strokeWidth="1.2" />
-      <text x="8" y="24" fontSize="11" fill="#334155">{ffType === "jk" ? "J" : "T"}</text>
+      <text x="8" y="24" fontSize="11" fill="#334155">{ffType === "jk" ? "J" : ffType === "t" ? "T" : "D"}</text>
       <text x="13" y="51" fontSize="8" fill="#334155">CLK</text>
       {ffType === "jk" && <text x="8" y="82" fontSize="11" fill="#334155">K</text>}
       <text x="68" y="24" fontSize="11" textAnchor="end" fill="#334155">Q</text>
@@ -1000,7 +1013,7 @@ export default function App() {
       `Generated: ${new Date().toLocaleString()}`,
       "",
       `Model: ${d.model === "mealy" ? "Mealy" : "Moore"}`,
-      `Flip-Flop type: ${d.ffType === "jk" ? "JK" : "T"}`,
+      `Flip-Flop type: ${d.ffType === "jk" ? "JK" : d.ffType === "t" ? "T" : "D"}`,
       `State variables: ${d.qNames.join(" ")}`,
       "",
       "State assignment:",
@@ -1098,6 +1111,13 @@ export default function App() {
                 desc="Single toggle input T per state variable"
                 checked={ffType === "t"}
                 onChange={() => setFfType("t")}
+              />
+              <Radio
+                name="ff"
+                label="D Flip-Flop"
+                desc="Single data input D = next-state value"
+                checked={ffType === "d"}
+                onChange={() => setFfType("d")}
               />
             </div>
           </Card>
@@ -1347,13 +1367,11 @@ export default function App() {
       <footer className="border-t border-slate-200 bg-white px-4 py-3">
         <div className="mx-auto flex w-full max-w-[1400px] flex-col items-center gap-3 sm:flex-row">
           <div className="flex flex-1 items-center justify-center sm:justify-start">
-            <button
-              type="button"
-              className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-            >
-              <Settings size={16} />
-              Settings
-            </button>
+            <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5">
+              <User size={16} className="text-indigo-500" />
+              <span className="font-mono text-sm font-semibold text-slate-700">1140503</span>
+              <span className="text-sm font-medium text-slate-600">張昱謙</span>
+            </div>
           </div>
 
           <div className="flex flex-1 flex-col items-center gap-1">

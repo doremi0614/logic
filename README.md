@@ -6,7 +6,7 @@
 ## 運算流程（按下 GENERATE 後）
 
 1. **狀態指定（State Assignment）**：依出現順序給每個狀態二進位編碼（A=00、B=01…），自動決定需要幾個 Flip-Flop
-2. **激勵表（Excitation Table）**：依 JK 或 T Flip-Flop 的激勵表，從「現態 → 次態」推導每個 FF 輸入的真值表（未出現的組合自動視為 don't care）
+2. **激勵表（Excitation Table）**：依 JK、T 或 D Flip-Flop 的激勵表，從「現態 → 次態」推導每個 FF 輸入的真值表（未出現的組合自動視為 don't care）
 3. **布林化簡**：用 Quine-McCluskey 演算法求質含項（prime implicants）並選出最小覆蓋
 4. **輸出**：
    - 化簡後的 FF 輸入方程式與輸出方程式（Mealy 看狀態+輸入；Moore 只看狀態）
