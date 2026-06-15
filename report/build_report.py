@@ -21,6 +21,7 @@ OUT = os.path.join(os.path.dirname(HERE), "期末專題報告書.pdf")
 pdfmetrics.registerFont(TTFont("JH", r"C:\Windows\Fonts\msjh.ttc", subfontIndex=0))
 pdfmetrics.registerFont(TTFont("JHB", r"C:\Windows\Fonts\msjhbd.ttc", subfontIndex=0))
 pdfmetrics.registerFont(TTFont("Mono", r"C:\Windows\Fonts\consola.ttf"))
+pdfmetrics.registerFont(TTFont("Sym", r"C:\Windows\Fonts\seguisym.ttf"))  # for ▶ play glyph
 pdfmetrics.registerFontFamily("JH", normal="JH", bold="JHB", italic="JH", boldItalic="JHB")
 
 INK = colors.HexColor("#1e293b")
@@ -124,8 +125,34 @@ sp(16)
 story.append(Paragraph("中華民國 115 年 6 月", st_meta))
 sp(20)
 story.append(Paragraph(
-    '線上展示：<font name="Mono" size="10" color="#4f46e5">https://doremi0614.github.io/logic/</font>',
+    '線上展示：<a href="https://doremi0614.github.io/logic/">'
+    '<font name="Mono" size="10" color="#4f46e5">https://doremi0614.github.io/logic/</font></a>',
     st_meta))
+sp(16)
+
+# Prominent demo-video callout (placed below the website link).
+VIDEO_URL = "https://youtu.be/cPSF_NMRxQI"
+vid_title = ParagraphStyle("vidTitle", fontName="JHB", fontSize=15, leading=22,
+                           alignment=TA_CENTER, textColor=colors.white)
+vid_link = ParagraphStyle("vidLink", fontName="Mono", fontSize=12, leading=20,
+                          alignment=TA_CENTER, textColor=colors.white)
+vid = Table(
+    [[Paragraph('<font name="Sym">&#9654;</font>&nbsp;&nbsp;這是示範影片連結（點我觀看）', vid_title)],
+     [Paragraph('<a href="%s"><font color="#ffffff">%s</font></a>' % (VIDEO_URL, VIDEO_URL), vid_link)]],
+    colWidths=[12 * cm])
+vid.setStyle(TableStyle([
+    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#dc2626")),
+    ("ROUNDEDCORNERS", [10, 10, 10, 10]),
+    ("TOPPADDING", (0, 0), (-1, 0), 12),
+    ("BOTTOMPADDING", (0, -1), (-1, -1), 12),
+    ("TOPPADDING", (0, 1), (-1, 1), 0),
+    ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+    ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+]))
+vid.hAlign = "CENTER"
+story.append(vid)
 story.append(PageBreak())
 
 # ============================ TOC (manual) ============================
@@ -165,7 +192,7 @@ h2("1.3　系統概觀")
 p("系統採用現代、乾淨的淺色系工程軟體風格，畫面分為三個直行：左欄為輸入區（淡紅邊框）、"
   "中欄為運算結果區（淡藍邊框）、右欄為電路圖區（淡綠邊框），最下方為操作列。整體具備響應式設計（RWD），"
   "在較小螢幕時會自動由三欄變為單欄垂直排列。")
-figure("app-overview.png", 16.5, "圖 1　系統整體介面（三欄式佈局，底部顯示作者學號姓名）")
+figure("app-overview.png", 16.5, "圖 1　系統整體介面（三欄式佈局，頂部與底部皆顯示作者學號姓名）")
 story.append(PageBreak())
 
 # ============================ 2. 功能總覽 ============================
@@ -439,6 +466,7 @@ bullets([
     "Vite 官方文件　https://vite.dev/",
     "專案原始碼　https://github.com/doremi0614/logic",
     "線上展示　https://doremi0614.github.io/logic/",
+    "示範影片　https://youtu.be/cPSF_NMRxQI",
 ])
 
 # ============================ Build ============================
