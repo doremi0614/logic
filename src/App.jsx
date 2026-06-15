@@ -6,13 +6,10 @@ import {
   FileText,
   Info,
   Maximize,
-  Minus,
   Play,
   Plus,
-  Square,
   Trash2,
   User,
-  X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -1060,16 +1057,10 @@ export default function App() {
             Sequential Circuit Design Automation System
           </h1>
         </div>
-        <div className="flex items-center gap-1">
-          <button type="button" title="Minimize" className="rounded p-1.5 text-slate-300 transition hover:bg-slate-700 hover:text-white">
-            <Minus size={14} />
-          </button>
-          <button type="button" title="Maximize" className="rounded p-1.5 text-slate-300 transition hover:bg-slate-700 hover:text-white">
-            <Square size={12} />
-          </button>
-          <button type="button" title="Close" className="rounded p-1.5 text-slate-300 transition hover:bg-red-600 hover:text-white">
-            <X size={14} />
-          </button>
+        <div className="flex items-center gap-2 rounded-md border border-slate-600 bg-slate-700/60 px-3 py-1.5">
+          <User size={15} className="text-sky-400" />
+          <span className="font-mono text-sm font-semibold text-white">1140503</span>
+          <span className="text-sm font-medium text-slate-200">張昱謙</span>
         </div>
       </header>
 
